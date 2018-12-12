@@ -18,6 +18,7 @@
 //! Defines a `BufferBuilder` capable of creating a `Buffer` which can be used as an internal
 //! buffer in an `ArrayData` object.
 
+use std::sync::Arc;
 use std::any::Any;
 use std::io::Write;
 use std::marker::PhantomData;
@@ -207,10 +208,7 @@ impl BufferBuilderTrait<BooleanType> for BufferBuilder<BooleanType> {
 }
 
 /// Trait for dealing with different array builders at runtime
-pub trait ArrayBuilder {
-    /// The type of array that this builder creates
-    type ArrayType: Array;
-
+pub trait ArrayBuilder: Any {
     /// Returns the builder as an owned `Any` type so that it can be `downcast` to a specific
     /// implementation before calling it's `finish` method
     fn into_any(self) -> Box<Any>;
@@ -219,7 +217,7 @@ pub trait ArrayBuilder {
     fn len(&self) -> usize;
 
     /// Builds the array
-    fn finish(self) -> Self::ArrayType;
+    fn finish(self) -> ArrayRef;
 }
 
 ///  Array builder for fixed-width primitive types
@@ -241,8 +239,6 @@ pub type Float32Builder = PrimitiveArrayBuilder<Float32Type>;
 pub type Float64Builder = PrimitiveArrayBuilder<Float64Type>;
 
 impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveArrayBuilder<T> {
-    type ArrayType = PrimitiveArray<T>;
-
     /// Returns the builder as an owned `Any` type so that it can be `downcast` to a specific
     /// implementation before calling it's `finish` method
     fn into_any(self) -> Box<Any> {
@@ -255,16 +251,8 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveArrayBuilder<T> {
     }
 
     /// Builds the PrimitiveArray
-    fn finish(self) -> PrimitiveArray<T> {
-        let len = self.len();
-        let null_bit_buffer = self.bitmap_builder.finish();
-        let data = ArrayData::builder(T::get_data_type())
-            .len(len)
-            .null_count(len - bit_util::count_set_bits(null_bit_buffer.data()))
-            .add_buffer(self.values_builder.finish())
-            .null_bit_buffer(null_bit_buffer)
-            .build();
-        PrimitiveArray::<T>::from(data)
+    fn finish(self) -> ArrayRef {
+        Arc::new(self.finish())
     }
 }
 
@@ -311,6 +299,21 @@ impl<T: ArrowPrimitiveType> PrimitiveArrayBuilder<T> {
         self.values_builder.push_slice(v)?;
         Ok(())
     }
+
+    pub fn finish(self) -> PrimitiveArray<T> {
+        let len = self.len();
+        let null_bit_buffer = self.bitmap_builder.finish();
+        let null_count = len - bit_util::count_set_bits(null_bit_buffer.data());
+        let mut b = ArrayData::builder(T::get_data_type())
+            .len(len)
+            .null_count(null_count)
+            .add_buffer(self.values_builder.finish())
+            ;
+        if null_count > 0 {
+            b = b.null_bit_buffer(null_bit_buffer)
+        }
+        PrimitiveArray::<T>::from(b.build())
+    }
 }
 
 ///  Array builder for `ListArray`
@@ -339,8 +342,6 @@ impl<T: ArrayBuilder> ArrayBuilder for ListArrayBuilder<T>
 where
     T: 'static,
 {
-    type ArrayType = ListArray;
-
     /// Returns the builder as an owned `Any` type so that it can be `downcast` to a specific
     /// implementation before calling it's `finish` method.
     fn into_any(self) -> Box<Any> {
@@ -353,7 +354,30 @@ where
     }
 
     /// Builds the `ListArray`
-    fn finish(self) -> ListArray {
+    fn finish(self) -> ArrayRef {
+        Arc::new(self.finish())
+    }
+}
+
+impl<T: ArrayBuilder> ListArrayBuilder<T> {
+    /// Returns the child array builder as a mutable reference.
+    ///
+    /// This mutable reference can be used to push values into the child array builder,
+    /// but you must call `append` to delimit each distinct list value.
+    pub fn values(&mut self) -> &mut T {
+        &mut self.values_builder
+    }
+
+    /// Finish the current variable-length list array slot
+    pub fn append(&mut self, is_valid: bool) -> Result<()> {
+        self.offsets_builder
+            .push(self.values_builder.len() as i32)?;
+        self.bitmap_builder.push(is_valid)?;
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn finish(self) -> ListArray {
         let len = self.len();
         let values_arr = self
             .values_builder
@@ -376,33 +400,12 @@ where
     }
 }
 
-impl<T: ArrayBuilder> ListArrayBuilder<T> {
-    /// Returns the child array builder as a mutable reference.
-    ///
-    /// This mutable reference can be used to push values into the child array builder,
-    /// but you must call `append` to delimit each distinct list value.
-    pub fn values(&mut self) -> &mut T {
-        &mut self.values_builder
-    }
-
-    /// Finish the current variable-length list array slot
-    pub fn append(&mut self, is_valid: bool) -> Result<()> {
-        self.offsets_builder
-            .push(self.values_builder.len() as i32)?;
-        self.bitmap_builder.push(is_valid)?;
-        self.len += 1;
-        Ok(())
-    }
-}
-
 ///  Array builder for `BinaryArray`
 pub struct BinaryArrayBuilder {
     builder: ListArrayBuilder<UInt8Builder>,
 }
 
 impl ArrayBuilder for BinaryArrayBuilder {
-    type ArrayType = BinaryArray;
-
     /// Returns the builder as an owned `Any` type so that it can be `downcast` to a specific
     /// implementation before calling it's `finish` method.
     fn into_any(self) -> Box<Any> {
@@ -415,8 +418,8 @@ impl ArrayBuilder for BinaryArrayBuilder {
     }
 
     /// Builds the `BinaryArray`
-    fn finish(self) -> BinaryArray {
-        BinaryArray::from(self.builder.finish())
+    fn finish(self) -> ArrayRef {
+        Arc::new(self.finish())
     }
 }
 
@@ -452,6 +455,122 @@ impl BinaryArrayBuilder {
     pub fn append(&mut self, is_valid: bool) -> Result<()> {
         self.builder.append(is_valid)
     }
+
+    pub fn finish(self) -> BinaryArray {
+        BinaryArray::from(self.builder.finish())
+    }
+}
+
+pub struct StructArrayBuilder {
+    fields: Vec<Field>,
+    field_builders: Vec<Box<Any>>,
+    bitmap_builder: BooleanBufferBuilder,
+}
+
+impl StructArrayBuilder {
+    pub fn new(capacity: usize, fields: Vec<Field>, field_builders: Vec<Box<Any>>) -> Self {
+        Self {
+            fields: fields,
+            field_builders: field_builders,
+            bitmap_builder: BooleanBufferBuilder::new(capacity),
+        }
+    }
+
+    pub fn append(&mut self, is_valid: bool) -> Result<()> {
+        self.bitmap_builder.push(is_valid)
+    }
+
+    pub fn field_builder<T: ArrayBuilder>(&self, i: usize) -> &T {
+        self.field_builders[i].downcast_ref::<T>().unwrap()
+    }
+
+    pub fn field_builder_mut<T: ArrayBuilder>(&mut self, i: usize) -> &mut T {
+        self.field_builders[i].downcast_mut::<T>().unwrap()
+    }
+
+    fn finish(self) -> StructArray {
+        let combined: Vec<(Field, ArrayRef)> =
+            self.fields.into_iter().zip(self.field_builders.into_iter())
+            .map(|(f, fb)| { Self::finish_one(f, fb) })
+            .collect();
+        StructArray::from(combined)
+    }
+
+    fn finish_one(f: Field, fb: Box<Any>) -> (Field, ArrayRef) {
+        match f.data_type() {
+            DataType::Boolean => {
+                let b = fb.downcast::<BooleanBuilder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::UInt8 => {
+                let b = fb.downcast::<UInt8Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::UInt16 => {
+                let b = fb.downcast::<UInt16Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::UInt32 => {
+                let b = fb.downcast::<UInt32Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::UInt64 => {
+                let b = fb.downcast::<UInt64Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Int8 => {
+                let b = fb.downcast::<Int8Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Int16 => {
+                let b = fb.downcast::<Int16Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Int32 => {
+                let b = fb.downcast::<Int32Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Int64 => {
+                let b = fb.downcast::<Int64Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Float32 => {
+                let b = fb.downcast::<Float32Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Float64 => {
+                let b = fb.downcast::<Float64Builder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Utf8 => {
+                let b = fb.downcast::<BinaryArrayBuilder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            DataType::Struct(_) => {
+                let b = fb.downcast::<StructArrayBuilder>().unwrap();
+                (f, Arc::new(b.finish()))
+            },
+            _ => panic!("Unimplemented!"),
+        }
+    }
+
+}
+
+impl ArrayBuilder for StructArrayBuilder {
+    fn into_any(self) -> Box<Any> {
+        Box::new(self)
+    }
+
+    /// Returns the number of array slots in the builder
+    fn len(&self) -> usize {
+        unimplemented!()
+    }
+
+    /// Builds the `ListArray`
+    fn finish(self) -> ArrayRef {
+        Arc::new(self.finish())
+    }
+
 }
 
 #[cfg(test)]
@@ -459,6 +578,44 @@ mod tests {
     use crate::array::Array;
 
     use super::*;
+
+    #[test]
+    fn test_struct_builder() {
+        let boolean_data = ArrayData::builder(DataType::Boolean)
+            .len(4)
+            .add_buffer(Buffer::from([12_u8]))
+            .build();
+        let int_data = ArrayData::builder(DataType::Int32)
+            .len(4)
+            .add_buffer(Buffer::from([42, 28, 19, 31].to_byte_slice()))
+            .build();
+
+        let a = BooleanBuilder::new(1);
+        let b = Int32Builder::new(1);
+        let mut v = Vec::new();
+        let mut fs = Vec::new();
+        v.push(Box::new(a) as Box<Any>);
+        fs.push(Field::new("f1", DataType::Boolean, false));
+        v.push(Box::new(b) as Box<Any>);
+        fs.push(Field::new("f2", DataType::Int32, false));
+        let mut struct_builder = StructArrayBuilder::new(5, fs, v);
+
+        let a1 = struct_builder.field_builder_mut::<BooleanBuilder>(0);
+        a1.push(false).unwrap();
+        a1.push(false).unwrap();
+        a1.push(true).unwrap();
+        a1.push(true).unwrap();
+
+        let a2 = struct_builder.field_builder_mut::<Int32Builder>(1);
+        a2.push(42).unwrap();
+        a2.push(28).unwrap();
+        a2.push(19).unwrap();
+        a2.push(31).unwrap();
+
+        let array = struct_builder.finish();
+        assert_eq!(boolean_data, array.column(0).data());
+        assert_eq!(int_data, array.column(1).data());
+    }
 
     #[test]
     fn test_builder_i32_empty() {
@@ -602,7 +759,8 @@ mod tests {
         for i in 0..5 {
             assert!(!arr.is_null(i));
             assert!(arr.is_valid(i));
-            assert_eq!(i as i32, arr.value(i));
+            let bb = arr.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert_eq!(i as i32, bb.value(i));
         }
     }
 

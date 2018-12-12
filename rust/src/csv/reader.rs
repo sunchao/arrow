@@ -109,7 +109,7 @@ fn build_primitive_array<T: ArrowPrimitiveType>(
             _ => builder.push_null().unwrap(),
         }
     }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    Ok(Arc::new(builder.finish()))
 }
 
 impl Reader {
@@ -163,20 +163,19 @@ impl Reader {
                     &DataType::Float32 => build_primitive_array::<Float32Type>(rows, i),
                     &DataType::Float64 => build_primitive_array::<Float64Type>(rows, i),
                     &DataType::Utf8 => {
-                        let values_builder: UInt8Builder = UInt8Builder::new(rows.len());
-                        let mut list_builder = ListArrayBuilder::new(values_builder);
+                        let mut binary_builder = BinaryArrayBuilder::new(rows.len());
                         for row_index in 0..rows.len() {
                             match rows[row_index].get(*i) {
                                 Some(s) => {
-                                    list_builder.values().push_slice(s.as_bytes()).unwrap();
-                                    list_builder.append(true).unwrap();
+                                    binary_builder.push_string(s).unwrap();
                                 }
                                 _ => {
-                                    list_builder.append(false).unwrap();
+                                    binary_builder.append(false).unwrap();
                                 }
                             }
                         }
-                        Ok(Arc::new(BinaryArray::from(list_builder.finish())) as ArrayRef)
+                        let ba: BinaryArray = binary_builder.finish();
+                        Ok(Arc::new(ba) as ArrayRef)
                     }
                     other => Err(ArrowError::ParseError(format!(
                         "Unsupported data type {:?}",
