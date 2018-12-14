@@ -212,6 +212,8 @@ pub trait ArrayBuilder: Any {
     /// Returns the builder as an owned `Any` type so that it can be `downcast` to a specific
     /// implementation before calling it's `finish` method
     fn into_any(self) -> Box<Any>;
+    fn to_builder(self: Box<Self>) -> Box<ArrayBuilder>;
+    fn to_any(self: Box<ArrayBuilder>) -> Box<Any>;
 
     /// Returns the number of array slots in the builder
     fn len(&self) -> usize;
@@ -317,19 +319,21 @@ impl<T: ArrowPrimitiveType> PrimitiveArrayBuilder<T> {
 }
 
 ///  Array builder for `ListArray`
-pub struct ListArrayBuilder<T: ArrayBuilder> {
+pub struct ListArrayBuilder {
+    value_type: DataType,
     offsets_builder: Int32BufferBuilder,
     bitmap_builder: BooleanBufferBuilder,
-    values_builder: T,
+    values_builder: Box<ArrayBuilder>,
     len: usize,
 }
 
-impl<T: ArrayBuilder> ListArrayBuilder<T> {
+impl ListArrayBuilder {
     /// Creates a new `ListArrayBuilder` from a given values array builder
-    pub fn new(values_builder: T) -> Self {
+    pub fn new(value_type: DataType, values_builder: Box<ArrayBuilder>) -> Self {
         let mut offsets_builder = Int32BufferBuilder::new(values_builder.len() + 1);
         offsets_builder.push(0).unwrap();
         Self {
+            value_type: value_type,
             offsets_builder,
             bitmap_builder: BooleanBufferBuilder::new(values_builder.len()),
             values_builder,
@@ -338,10 +342,7 @@ impl<T: ArrayBuilder> ListArrayBuilder<T> {
     }
 }
 
-impl<T: ArrayBuilder> ArrayBuilder for ListArrayBuilder<T>
-where
-    T: 'static,
-{
+impl ArrayBuilder for ListArrayBuilder {
     /// Returns the builder as an owned `Any` type so that it can be `downcast` to a specific
     /// implementation before calling it's `finish` method.
     fn into_any(self) -> Box<Any> {
@@ -359,19 +360,18 @@ where
     }
 }
 
-impl<T: ArrayBuilder> ListArrayBuilder<T> {
+impl ListArrayBuilder {
     /// Returns the child array builder as a mutable reference.
     ///
     /// This mutable reference can be used to push values into the child array builder,
     /// but you must call `append` to delimit each distinct list value.
-    pub fn values(&mut self) -> &mut T {
-        &mut self.values_builder
+    pub fn values<T: ArrayBuilder>(&mut self) -> &mut T {
+        &mut self.values_builder.as_any().downcast_mut::<T>().unwrap()
     }
 
     /// Finish the current variable-length list array slot
     pub fn append(&mut self, is_valid: bool) -> Result<()> {
-        self.offsets_builder
-            .push(self.values_builder.len() as i32)?;
+        self.offsets_builder.push(self.values_builder.len() as i32)?;
         self.bitmap_builder.push(is_valid)?;
         self.len += 1;
         Ok(())
@@ -381,9 +381,7 @@ impl<T: ArrayBuilder> ListArrayBuilder<T> {
         let len = self.len();
         let values_arr = self
             .values_builder
-            .into_any()
-            .downcast::<T>()
-            .unwrap()
+            .as_any()
             .finish();
         let values_data = values_arr.data();
 
@@ -400,9 +398,71 @@ impl<T: ArrayBuilder> ListArrayBuilder<T> {
     }
 }
 
+fn finish_internal(ty: &DataType, builder: Box<Any>) -> ArrayRef {
+    match ty {
+        DataType::Boolean => {
+            let b = builder.downcast::<BooleanBuilder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::UInt8 => {
+            let b = builder.downcast::<UInt8Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::UInt16 => {
+            let b = builder.downcast::<UInt16Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::UInt32 => {
+            let b = builder.downcast::<UInt32Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::UInt64 => {
+            let b = builder.downcast::<UInt64Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Int8 => {
+            let b = builder.downcast::<Int8Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Int16 => {
+            let b = builder.downcast::<Int16Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Int32 => {
+            let b = builder.downcast::<Int32Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Int64 => {
+            let b = builder.downcast::<Int64Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Float32 => {
+            let b = builder.downcast::<Float32Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Float64 => {
+            let b = builder.downcast::<Float64Builder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Utf8 => {
+            let b = builder.downcast::<BinaryArrayBuilder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::List(_) => {
+            let b = builder.downcast::<ArrayBuilder>().unwrap();
+            Arc::new(b.finish())
+        },
+        DataType::Struct(_) => {
+            let b = builder.downcast::<StructArrayBuilder>().unwrap();
+            Arc::new(b.finish())
+        },
+        _ => panic!("Unimplemented!"),
+    }
+}
+
 ///  Array builder for `BinaryArray`
 pub struct BinaryArrayBuilder {
-    builder: ListArrayBuilder<UInt8Builder>,
+    builder: ListArrayBuilder,
 }
 
 impl ArrayBuilder for BinaryArrayBuilder {
@@ -428,7 +488,7 @@ impl BinaryArrayBuilder {
     pub fn new(capacity: usize) -> Self {
         let values_builder = UInt8Builder::new(capacity);
         Self {
-            builder: ListArrayBuilder::new(values_builder),
+            builder: ListArrayBuilder::new(Box::new(values_builder)),
         }
     }
 
@@ -497,61 +557,8 @@ impl StructArrayBuilder {
     }
 
     fn finish_one(f: Field, fb: Box<Any>) -> (Field, ArrayRef) {
-        match f.data_type() {
-            DataType::Boolean => {
-                let b = fb.downcast::<BooleanBuilder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::UInt8 => {
-                let b = fb.downcast::<UInt8Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::UInt16 => {
-                let b = fb.downcast::<UInt16Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::UInt32 => {
-                let b = fb.downcast::<UInt32Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::UInt64 => {
-                let b = fb.downcast::<UInt64Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Int8 => {
-                let b = fb.downcast::<Int8Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Int16 => {
-                let b = fb.downcast::<Int16Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Int32 => {
-                let b = fb.downcast::<Int32Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Int64 => {
-                let b = fb.downcast::<Int64Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Float32 => {
-                let b = fb.downcast::<Float32Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Float64 => {
-                let b = fb.downcast::<Float64Builder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Utf8 => {
-                let b = fb.downcast::<BinaryArrayBuilder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            DataType::Struct(_) => {
-                let b = fb.downcast::<StructArrayBuilder>().unwrap();
-                (f, Arc::new(b.finish()))
-            },
-            _ => panic!("Unimplemented!"),
-        }
+        let array = finish_internal(f.data_type(), fb);
+        (f, array)
     }
 
 }
