@@ -66,6 +66,7 @@ use chrono::prelude::*;
 use crate::array_data::{ArrayData, ArrayDataRef};
 use crate::buffer::{Buffer, MutableBuffer};
 use crate::builder::*;
+use crate::compare::*;
 use crate::datatypes::*;
 use crate::memory;
 use crate::util::bit_util;
@@ -81,7 +82,7 @@ const NANOSECONDS: i64 = 1_000_000_000;
 
 /// Trait for dealing with different types of array at runtime when the type of the
 /// array is not known in advance
-pub trait Array: Send + Sync {
+pub trait Array: Send + Sync + ArrayEqual {
     /// Returns the array as `Any` so that it can be downcast to a specific implementation
     fn as_any(&self) -> &Any;
 
@@ -206,7 +207,7 @@ fn slice_data(data: ArrayDataRef, mut offset: usize, length: usize) -> ArrayData
 /// ----------------------------------------------------------------------------
 /// Implementations of different array types
 
-struct RawPtrBox<T> {
+pub(super) struct RawPtrBox<T> {
     inner: *const T,
 }
 
@@ -215,7 +216,7 @@ impl<T> RawPtrBox<T> {
         Self { inner }
     }
 
-    fn get(&self) -> *const T {
+    pub(super) fn get(&self) -> *const T {
         self.inner
     }
 }
@@ -335,7 +336,6 @@ where
     ///
     /// If a data type cannot be converted to `NaiveDateTime`, a `None` is returned.
     /// A valid value is expected, thus the user should first check for validity.
-    /// TODO: extract constants into static variables
     pub fn value_as_datetime(&self, i: usize) -> Option<NaiveDateTime> {
         let v = i64::from(self.value(i));
         match self.data_type() {
@@ -752,7 +752,7 @@ impl ListArray {
     }
 
     #[inline]
-    fn value_offset_at(&self, i: usize) -> i32 {
+    pub(crate) fn value_offset_at(&self, i: usize) -> i32 {
         unsafe { *self.value_offsets.get().offset(i as isize) }
     }
 }
@@ -806,7 +806,7 @@ impl Array for ListArray {
 pub struct BinaryArray {
     data: ArrayDataRef,
     value_offsets: RawPtrBox<i32>,
-    value_data: RawPtrBox<u8>,
+    pub(super) value_data: RawPtrBox<u8>,
 }
 
 impl BinaryArray {
@@ -848,8 +848,10 @@ impl BinaryArray {
         self.value_offset_at(i + 1) - self.value_offset_at(i)
     }
 
+    // TODO: consider adding a trait for both List and Binary
+
     #[inline]
-    fn value_offset_at(&self, i: usize) -> i32 {
+    pub(super) fn value_offset_at(&self, i: usize) -> i32 {
         unsafe { *self.value_offsets.get().offset(i as isize) }
     }
 }
@@ -971,6 +973,10 @@ impl StructArray {
     pub fn column(&self, pos: usize) -> &ArrayRef {
         &self.boxed_fields[pos]
     }
+
+    pub fn num_columns(&self) -> usize {
+        self.boxed_fields.len()
+    }
 }
 
 impl From<ArrayDataRef> for StructArray {
@@ -1081,6 +1087,14 @@ mod tests {
                 assert!(!arr.is_valid(i));
             }
         }
+    }
+
+    #[test]
+    fn test_primitive_array_equal() {
+        // Test building a primitive array with null values
+        let arr1 = Int32Array::from(vec![Some(0), None, Some(2), None, Some(4)]);
+        let arr2 = Int32Array::from(vec![Some(0), None, Some(2), None, Some(4)]);
+        assert_eq!(arr1, arr2);
     }
 
     #[test]

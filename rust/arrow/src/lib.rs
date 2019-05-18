@@ -31,6 +31,7 @@ pub mod array_data;
 pub mod bitmap;
 pub mod buffer;
 pub mod builder;
+pub mod compare;
 pub mod compute;
 pub mod csv;
 pub mod datatypes;

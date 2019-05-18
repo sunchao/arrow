@@ -349,6 +349,18 @@ impl<T: ArrowPrimitiveType> PrimitiveBuilder<T> {
         Ok(())
     }
 
+    pub fn append_values(&mut self, v: &[T::Native], b: &[bool]) -> Result<()> {
+        assert_eq!(v.len(), b.len());
+        for (x, y) in v.iter().zip(b.iter()) {
+            if *y {
+                self.append_value(*x)?;
+            } else {
+                self.append_null()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Builds the `PrimitiveArray` and reset this builder.
     pub fn finish(&mut self) -> PrimitiveArray<T> {
         let len = self.len();
